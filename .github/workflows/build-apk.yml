@@ -18,44 +18,89 @@ jobs:
   build-apk:
     name: Build Android APK
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Locate app project
+      - name: Find or extract the game project
         id: locate
         shell: bash
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
 
-          CONFIG_PATH="$(find . -maxdepth 6 -type f \( -name 'capacitor.config.ts' -o -name 'capacitor.config.json' -o -name 'capacitor.config.js' \) \
-            -not -path '*/node_modules/*' \
-            -not -path '*/.git/*' \
-            -print -quit)"
+          find_config() {
+            find "$1" -type f \
+              \( -name 'capacitor.config.ts' -o -name 'capacitor.config.json' -o -name 'capacitor.config.js' -o -name 'capacitor.config.mjs' \) \
+              -not -path '*/.git/*' \
+              -not -path '*/node_modules/*' \
+              -not -path '*/.github/*' \
+              -print -quit 2>/dev/null || true
+          }
 
-          if [ -z "$CONFIG_PATH" ]; then
-            echo "ERROR: capacitor.config.ts/json/js was not found. Make sure the complete game project is committed to this repository."
+          PROJECT_CONFIG="$(find_config "$GITHUB_WORKSPACE")"
+          PROJECT_SOURCE="repository files"
+
+          # If the project is stored in the repository as a ZIP, extract it automatically.
+          if [ -z "$PROJECT_CONFIG" ]; then
+            echo "No Capacitor config found among the committed files. Searching repository ZIP archives..."
+            EXTRACT_BASE="$RUNNER_TEMP/shakaf-project-extracted"
+            mkdir -p "$EXTRACT_BASE"
+            ZIP_FOUND="false"
+            INDEX=0
+
+            while IFS= read -r -d '' ZIP_FILE; do
+              INDEX=$((INDEX + 1))
+              EXTRACT_DIR="$EXTRACT_BASE/archive-$INDEX"
+              mkdir -p "$EXTRACT_DIR"
+
+              echo "Checking archive: ${ZIP_FILE#"$GITHUB_WORKSPACE"/}"
+              if ! unzip -q "$ZIP_FILE" -d "$EXTRACT_DIR"; then
+                echo "Skipping archive that could not be extracted: $ZIP_FILE"
+                continue
+              fi
+
+              CANDIDATE_CONFIG="$(find_config "$EXTRACT_DIR")"
+              if [ -n "$CANDIDATE_CONFIG" ]; then
+                PROJECT_CONFIG="$CANDIDATE_CONFIG"
+                PROJECT_SOURCE="ZIP archive: ${ZIP_FILE#"$GITHUB_WORKSPACE"/}"
+                ZIP_FOUND="true"
+                break
+              fi
+            done < <(find "$GITHUB_WORKSPACE" -type f -iname '*.zip' \
+              -not -path '*/.git/*' \
+              -not -path '*/node_modules/*' \
+              -print0 | sort -z)
+          fi
+
+          if [ -z "$PROJECT_CONFIG" ]; then
+            echo "::error::No Capacitor project was found. Commit the extracted game files (including capacitor.config.ts and package.json) or upload the original project ZIP into this repository."
+            echo "Repository files at the top level:"
+            ls -la "$GITHUB_WORKSPACE"
+            echo "Files named capacitor.config.* found:"
+            find "$GITHUB_WORKSPACE" "$RUNNER_TEMP/shakaf-project-extracted" -type f -name 'capacitor.config.*' -print 2>/dev/null || true
             exit 1
           fi
 
-          PROJECT_DIR="$(dirname "$CONFIG_PATH")"
+          PROJECT_DIR="$(dirname "$PROJECT_CONFIG")"
 
-          if [ ! -f "$PROJECT_DIR/package.json" ]; then
-            echo "ERROR: package.json was not found beside $CONFIG_PATH."
+          for REQUIRED_FILE in package.json index.html; do
+            if [ ! -f "$PROJECT_DIR/$REQUIRED_FILE" ]; then
+              echo "::error::The detected project is missing $REQUIRED_FILE next to $PROJECT_CONFIG. Make sure you uploaded the complete project ZIP or all project files."
+              exit 1
+            fi
+          done
+
+          if [ ! -d "$PROJECT_DIR/src" ]; then
+            echo "::error::The detected project has no src/ directory: $PROJECT_DIR"
             exit 1
           fi
 
-          if [ ! -f "$PROJECT_DIR/index.html" ]; then
-            echo "ERROR: index.html was not found in $PROJECT_DIR. Check the project root."
-            exit 1
-          fi
-
-          PROJECT_DIR="${PROJECT_DIR#./}"
-          [ -n "$PROJECT_DIR" ] || PROJECT_DIR="."
+          echo "Project found: $PROJECT_DIR"
+          echo "Project source: $PROJECT_SOURCE"
           echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
-          echo "Project directory: $PROJECT_DIR"
+          echo "project_source=$PROJECT_SOURCE" >> "$GITHUB_OUTPUT"
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -71,27 +116,52 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Install Android SDK packages and accept licenses
+      - name: Install Android SDK packages
         shell: bash
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
+
           SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
           if [ -z "$SDK_ROOT" ]; then
-            echo "ERROR: Android SDK path was not configured by setup-android."
+            echo "::error::Android SDK path was not configured."
             exit 1
           fi
-          yes | sdkmanager --sdk_root="$SDK_ROOT" --licenses >/dev/null
+
+          if ! command -v sdkmanager >/dev/null 2>&1; then
+            echo "::error::sdkmanager was not found after setting up Android SDK."
+            exit 1
+          fi
+
+          # sdkmanager may close the input pipe early after accepting all licenses.
+          set +o pipefail
+          yes | sdkmanager --sdk_root="$SDK_ROOT" --licenses >/dev/null 2>&1 || true
+          set -o pipefail
+
           sdkmanager --sdk_root="$SDK_ROOT" --install \
             "platform-tools" \
             "platforms;android-36" \
             "build-tools;36.0.0"
 
-      - name: Install project and Capacitor dependencies
+      - name: Install web dependencies
         working-directory: ${{ steps.locate.outputs.project_dir }}
         shell: bash
         run: |
-          set -euo pipefail
-          npm install --no-audit --no-fund \
+          set -Eeuo pipefail
+          if [ -f package-lock.json ]; then
+            npm ci --no-audit --no-fund
+          elif [ -f npm-shrinkwrap.json ]; then
+            npm ci --no-audit --no-fund
+          else
+            echo "No npm lockfile found; installing from package.json."
+            npm install --no-audit --no-fund
+          fi
+
+      - name: Install Capacitor Android dependencies
+        working-directory: ${{ steps.locate.outputs.project_dir }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          npm install --no-save --no-package-lock --no-audit --no-fund \
             @capacitor/core@^8 \
             @capacitor/cli@^8 \
             @capacitor/android@^8 \
@@ -103,30 +173,30 @@ jobs:
         working-directory: ${{ steps.locate.outputs.project_dir }}
         shell: bash
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
           if [ -f capacitor.config.ts ]; then
             sed -i '/^[[:space:]]*bundledWebRuntime[[:space:]]*:/d' capacitor.config.ts
           fi
 
-      - name: Build web app
+      - name: Build web application
         working-directory: ${{ steps.locate.outputs.project_dir }}
         run: npm run build
 
-      - name: Add Android platform if missing
+      - name: Create Android platform if needed
         working-directory: ${{ steps.locate.outputs.project_dir }}
         shell: bash
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
           if [ ! -d android ]; then
             npx cap add android
           elif [ ! -f android/gradlew ]; then
-            echo "ERROR: An android/ directory exists, but android/gradlew is missing. Remove the incomplete android directory or restore the complete native Android project."
+            echo "::error::An incomplete android/ directory exists: android/gradlew is missing. Remove that incomplete directory from the project ZIP or include a valid Android platform directory."
             exit 1
           else
-            echo "Existing Android platform found."
+            echo "Using the Android platform already included in the project."
           fi
 
-      - name: Sync Capacitor Android project
+      - name: Sync Capacitor project
         working-directory: ${{ steps.locate.outputs.project_dir }}
         run: npx cap sync android
 
@@ -134,29 +204,30 @@ jobs:
         working-directory: ${{ steps.locate.outputs.project_dir }}/android
         shell: bash
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
           chmod +x ./gradlew
           ./gradlew --no-daemon --stacktrace assembleDebug
 
-      - name: Prepare APK artifact
+      - name: Collect APK
         working-directory: ${{ steps.locate.outputs.project_dir }}
         shell: bash
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
           APK_PATH="android/app/build/outputs/apk/debug/app-debug.apk"
           if [ ! -f "$APK_PATH" ]; then
-            echo "ERROR: Gradle finished, but the expected APK was not found at $APK_PATH."
+            echo "::error::Gradle completed but the expected APK was not found. Available APK files:"
             find android -type f -name '*.apk' -print || true
             exit 1
           fi
-          mkdir -p output
-          cp "$APK_PATH" output/lale-saga.apk
-          ls -lh output/lale-saga.apk
 
-      - name: Upload APK
+          mkdir -p "$GITHUB_WORKSPACE/output"
+          cp "$APK_PATH" "$GITHUB_WORKSPACE/output/lale-saga-debug.apk"
+          ls -lh "$GITHUB_WORKSPACE/output/lale-saga-debug.apk"
+
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: lale-saga-debug-apk
-          path: ${{ steps.locate.outputs.project_dir }}/output/lale-saga.apk
+          path: output/lale-saga-debug.apk
           if-no-files-found: error
           retention-days: 14
