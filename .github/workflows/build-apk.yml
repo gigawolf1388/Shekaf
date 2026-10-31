@@ -21,213 +21,279 @@ jobs:
     timeout-minutes: 60
 
     steps:
+      # 1) دریافت Repository
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Find or extract the game project
+      # 2) پیدا کردن پروژه؛ اگر فقط ZIP در Repository باشد، آن را استخراج می‌کند.
+      - name: Locate or extract game project
         id: locate
         shell: bash
         run: |
           set -Eeuo pipefail
 
-          find_config() {
-            find "$1" -type f \
-              \( -name 'capacitor.config.ts' -o -name 'capacitor.config.json' -o -name 'capacitor.config.js' -o -name 'capacitor.config.mjs' \) \
-              -not -path '*/.git/*' \
-              -not -path '*/node_modules/*' \
-              -not -path '*/.github/*' \
-              -print -quit 2>/dev/null || true
+          find_valid_project() {
+            local search_root="$1"
+            local config_file
+            local project_dir
+
+            while IFS= read -r -d '' config_file; do
+              project_dir="$(dirname "$config_file")"
+
+              if [[ -f "$project_dir/package.json" && \
+                    -f "$project_dir/index.html" && \
+                    -d "$project_dir/src" ]]; then
+                printf '%s' "$config_file"
+                return 0
+              fi
+            done < <(
+              find "$search_root" -type f \
+                \( -name 'capacitor.config.ts' \
+                   -o -name 'capacitor.config.json' \
+                   -o -name 'capacitor.config.js' \
+                   -o -name 'capacitor.config.mjs' \) \
+                -not -path '*/.git/*' \
+                -not -path '*/node_modules/*' \
+                -not -path '*/.github/*' \
+                -print0 2>/dev/null
+            )
+
+            return 1
           }
 
-          PROJECT_CONFIG="$(find_config "$GITHUB_WORKSPACE")"
-          PROJECT_SOURCE="repository files"
+          PROJECT_CONFIG="$(find_valid_project "$GITHUB_WORKSPACE" || true)"
+          PROJECT_SOURCE="committed project files"
+          EXTRACT_BASE="$RUNNER_TEMP/shakaf-extracted"
 
-          # If the project is stored in the repository as a ZIP, extract it automatically.
-          if [ -z "$PROJECT_CONFIG" ]; then
-            echo "No Capacitor config found among the committed files. Searching repository ZIP archives..."
-            EXTRACT_BASE="$RUNNER_TEMP/shakaf-project-extracted"
+          # اگر فایل‌های پروژه مستقیماً در Repository نبودند، ZIPها را بررسی کن.
+          if [[ -z "$PROJECT_CONFIG" ]]; then
+            echo "No complete project directory found. Searching ZIP archives..."
             mkdir -p "$EXTRACT_BASE"
-            ZIP_FOUND="false"
-            INDEX=0
+            archive_number=0
 
-            while IFS= read -r -d '' ZIP_FILE; do
-              INDEX=$((INDEX + 1))
-              EXTRACT_DIR="$EXTRACT_BASE/archive-$INDEX"
-              mkdir -p "$EXTRACT_DIR"
+            while IFS= read -r -d '' zip_file; do
+              archive_number=$((archive_number + 1))
+              extract_dir="$EXTRACT_BASE/archive-$archive_number"
+              mkdir -p "$extract_dir"
 
-              echo "Checking archive: ${ZIP_FILE#"$GITHUB_WORKSPACE"/}"
-              if ! unzip -q "$ZIP_FILE" -d "$EXTRACT_DIR"; then
-                echo "Skipping archive that could not be extracted: $ZIP_FILE"
+              echo "Extracting: ${zip_file#"$GITHUB_WORKSPACE"/}"
+              if ! unzip -q "$zip_file" -d "$extract_dir"; then
+                echo "::warning::Could not extract archive: $zip_file"
                 continue
               fi
 
-              CANDIDATE_CONFIG="$(find_config "$EXTRACT_DIR")"
-              if [ -n "$CANDIDATE_CONFIG" ]; then
-                PROJECT_CONFIG="$CANDIDATE_CONFIG"
-                PROJECT_SOURCE="ZIP archive: ${ZIP_FILE#"$GITHUB_WORKSPACE"/}"
-                ZIP_FOUND="true"
+              candidate="$(find_valid_project "$extract_dir" || true)"
+              if [[ -n "$candidate" ]]; then
+                PROJECT_CONFIG="$candidate"
+                PROJECT_SOURCE="ZIP: ${zip_file#"$GITHUB_WORKSPACE"/}"
                 break
               fi
-            done < <(find "$GITHUB_WORKSPACE" -type f -iname '*.zip' \
-              -not -path '*/.git/*' \
-              -not -path '*/node_modules/*' \
-              -print0 | sort -z)
+            done < <(
+              find "$GITHUB_WORKSPACE" -type f -iname '*.zip' \
+                -not -path '*/.git/*' \
+                -not -path '*/node_modules/*' \
+                -print0 | sort -z
+            )
           fi
 
-          if [ -z "$PROJECT_CONFIG" ]; then
-            echo "::error::No Capacitor project was found. Commit the extracted game files (including capacitor.config.ts and package.json) or upload the original project ZIP into this repository."
-            echo "Repository files at the top level:"
+          if [[ -z "$PROJECT_CONFIG" ]]; then
+            echo "::error::No complete Capacitor/Vite project was found. The repository must contain either the extracted project or its ZIP archive. Required files: capacitor.config.*, package.json, index.html and src/."
+            echo "Repository root contents:"
             ls -la "$GITHUB_WORKSPACE"
-            echo "Files named capacitor.config.* found:"
-            find "$GITHUB_WORKSPACE" "$RUNNER_TEMP/shakaf-project-extracted" -type f -name 'capacitor.config.*' -print 2>/dev/null || true
+            echo "Any Capacitor config files found:"
+            find "$GITHUB_WORKSPACE" "$EXTRACT_BASE" -type f -name 'capacitor.config.*' -print 2>/dev/null || true
             exit 1
           fi
 
           PROJECT_DIR="$(dirname "$PROJECT_CONFIG")"
-
-          for REQUIRED_FILE in package.json index.html; do
-            if [ ! -f "$PROJECT_DIR/$REQUIRED_FILE" ]; then
-              echo "::error::The detected project is missing $REQUIRED_FILE next to $PROJECT_CONFIG. Make sure you uploaded the complete project ZIP or all project files."
-              exit 1
-            fi
-          done
-
-          if [ ! -d "$PROJECT_DIR/src" ]; then
-            echo "::error::The detected project has no src/ directory: $PROJECT_DIR"
-            exit 1
-          fi
-
-          echo "Project found: $PROJECT_DIR"
+          echo "Project directory: $PROJECT_DIR"
           echo "Project source: $PROJECT_SOURCE"
-          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
-          echo "project_source=$PROJECT_SOURCE" >> "$GITHUB_OUTPUT"
+          printf 'project_dir=%s\n' "$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+          printf 'project_source=%s\n' "$PROJECT_SOURCE" >> "$GITHUB_OUTPUT"
 
+      # 3) Node.js 22 برای Vite 7 و Capacitor 8
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '22'
 
+      # 4) Java 21 برای زنجیره ساخت Android جدید
       - name: Set up Java 21
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '21'
 
+      # 5) نسخه v4 بسته قدیمی و حذف‌شده SDK به نام tools را نصب نمی‌کند.
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools'
+          accept-android-sdk-licenses: 'true'
+          log-accepted-android-sdk-licenses: 'false'
 
-      - name: Install Android SDK packages
+      # 6) نصب نسخه پایدار SDK موردنیاز Capacitor 8
+      - name: Install Android platform and build tools
         shell: bash
         run: |
           set -Eeuo pipefail
 
-          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
-          if [ -z "$SDK_ROOT" ]; then
-            echo "::error::Android SDK path was not configured."
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          if [[ -z "$SDK_ROOT" || ! -d "$SDK_ROOT" ]]; then
+            echo "::error::Android SDK path is missing."
             exit 1
           fi
 
           if ! command -v sdkmanager >/dev/null 2>&1; then
-            echo "::error::sdkmanager was not found after setting up Android SDK."
+            echo "::error::sdkmanager was not added to PATH by setup-android."
             exit 1
           fi
 
-          # sdkmanager may close the input pipe early after accepting all licenses.
-          set +o pipefail
-          yes | sdkmanager --sdk_root="$SDK_ROOT" --licenses >/dev/null 2>&1 || true
-          set -o pipefail
-
           sdkmanager --sdk_root="$SDK_ROOT" --install \
-            "platform-tools" \
-            "platforms;android-36" \
-            "build-tools;36.0.0"
+            'platforms;android-36' \
+            'build-tools;36.0.0'
 
-      - name: Install web dependencies
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+
+      # 7) نصب دقیق وابستگی‌های وب پروژه
+      - name: Install project dependencies
         working-directory: ${{ steps.locate.outputs.project_dir }}
         shell: bash
         run: |
           set -Eeuo pipefail
-          if [ -f package-lock.json ]; then
-            npm ci --no-audit --no-fund
-          elif [ -f npm-shrinkwrap.json ]; then
+
+          if [[ -f package-lock.json || -f npm-shrinkwrap.json ]]; then
             npm ci --no-audit --no-fund
           else
-            echo "No npm lockfile found; installing from package.json."
+            echo "::warning::No npm lock file found; using npm install."
             npm install --no-audit --no-fund
           fi
 
-      - name: Install Capacitor Android dependencies
+      # 8) Capacitor و پلاگین‌های تعریف‌شده در config با major یکسان
+      - name: Install Capacitor 8 packages
         working-directory: ${{ steps.locate.outputs.project_dir }}
         shell: bash
         run: |
           set -Eeuo pipefail
-          npm install --no-save --no-package-lock --no-audit --no-fund \
-            @capacitor/core@^8 \
-            @capacitor/cli@^8 \
-            @capacitor/android@^8 \
-            @capacitor/status-bar@^8 \
-            @capacitor/splash-screen@^8 \
-            @capacitor/keyboard@^8
 
-      - name: Remove obsolete Capacitor config option
+          npm install --no-save --no-package-lock --no-audit --no-fund \
+            '@capacitor/core@^8' \
+            '@capacitor/cli@^8' \
+            '@capacitor/android@^8' \
+            '@capacitor/status-bar@^8' \
+            '@capacitor/splash-screen@^8' \
+            '@capacitor/keyboard@^8'
+
+          npx cap --version
+
+      # 9) حذف گزینه منسوخ‌شده‌ای که در config اولیه پروژه وجود دارد.
+      - name: Normalize Capacitor configuration
         working-directory: ${{ steps.locate.outputs.project_dir }}
         shell: bash
         run: |
           set -Eeuo pipefail
-          if [ -f capacitor.config.ts ]; then
+
+          if [[ -f capacitor.config.ts ]]; then
             sed -i '/^[[:space:]]*bundledWebRuntime[[:space:]]*:/d' capacitor.config.ts
+          elif [[ -f capacitor.config.js ]]; then
+            sed -i '/^[[:space:]]*bundledWebRuntime[[:space:]]*:/d' capacitor.config.js
+          elif [[ -f capacitor.config.mjs ]]; then
+            sed -i '/^[[:space:]]*bundledWebRuntime[[:space:]]*:/d' capacitor.config.mjs
           fi
 
+      # 10) ساخت وب و اطمینان از وجود خروجی قابل استفاده برای Capacitor
       - name: Build web application
         working-directory: ${{ steps.locate.outputs.project_dir }}
-        run: npm run build
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          npm run build
 
-      - name: Create Android platform if needed
+          if [[ ! -s dist/index.html ]]; then
+            echo "::error::Vite build did not create dist/index.html. Check the build output above."
+            exit 1
+          fi
+
+      # 11) ساخت پلتفرم Android فقط در صورت نیاز
+      - name: Prepare Android platform
         working-directory: ${{ steps.locate.outputs.project_dir }}
         shell: bash
         run: |
           set -Eeuo pipefail
-          if [ ! -d android ]; then
-            npx cap add android
-          elif [ ! -f android/gradlew ]; then
-            echo "::error::An incomplete android/ directory exists: android/gradlew is missing. Remove that incomplete directory from the project ZIP or include a valid Android platform directory."
-            exit 1
-          else
-            echo "Using the Android platform already included in the project."
+
+          # یک پوشه ناقص ناشی از اجرای ناموفق قبلی را خودکار بازسازی کن.
+          if [[ -d android && ( ! -f android/gradlew || ! -f android/app/build.gradle ) ]]; then
+            echo "::warning::Incomplete Android platform detected; recreating it with the installed Capacitor version."
+            rm -rf android
           fi
 
-      - name: Sync Capacitor project
-        working-directory: ${{ steps.locate.outputs.project_dir }}
-        run: npx cap sync android
+          if [[ ! -d android ]]; then
+            npx cap add android
+          fi
 
+          if [[ ! -f android/gradlew ]]; then
+            echo "::error::Capacitor did not generate android/gradlew."
+            exit 1
+          fi
+
+      # 12) کپی فایل‌های وب و نصب پلاگین‌های Native
+      - name: Sync Capacitor Android project
+        working-directory: ${{ steps.locate.outputs.project_dir }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          npx cap sync android
+
+      # 13) تولید APK آزمایشی قابل نصب
       - name: Build debug APK
         working-directory: ${{ steps.locate.outputs.project_dir }}/android
         shell: bash
         run: |
           set -Eeuo pipefail
           chmod +x ./gradlew
-          ./gradlew --no-daemon --stacktrace assembleDebug
+          ./gradlew --no-daemon --stacktrace --warning-mode all assembleDebug
 
-      - name: Collect APK
+          APK='app/build/outputs/apk/debug/app-debug.apk'
+          if [[ ! -s "$APK" ]]; then
+            echo "::error::Gradle finished but app-debug.apk was not generated. APK files found:"
+            find . -type f -name '*.apk' -print || true
+            exit 1
+          fi
+
+      # 14) انتقال APK به پوشه خروجی ثابت در Repository workspace
+      - name: Prepare APK artifact
         working-directory: ${{ steps.locate.outputs.project_dir }}
         shell: bash
         run: |
           set -Eeuo pipefail
-          APK_PATH="android/app/build/outputs/apk/debug/app-debug.apk"
-          if [ ! -f "$APK_PATH" ]; then
-            echo "::error::Gradle completed but the expected APK was not found. Available APK files:"
-            find android -type f -name '*.apk' -print || true
-            exit 1
-          fi
-
           mkdir -p "$GITHUB_WORKSPACE/output"
-          cp "$APK_PATH" "$GITHUB_WORKSPACE/output/lale-saga-debug.apk"
+          cp android/app/build/outputs/apk/debug/app-debug.apk \
+            "$GITHUB_WORKSPACE/output/lale-saga-debug.apk"
+          sha256sum "$GITHUB_WORKSPACE/output/lale-saga-debug.apk"
           ls -lh "$GITHUB_WORKSPACE/output/lale-saga-debug.apk"
 
-      - name: Upload APK artifact
+      # 15) تحویل فایل APK در بخش Artifacts اجرای Action
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: lale-saga-debug-apk
           path: output/lale-saga-debug.apk
           if-no-files-found: error
           retention-days: 14
+
+      # در صورت شکست، اطلاعات محیط برای عیب‌یابی خطای بعدی ثبت شود.
+      - name: Diagnostic information on failure
+        if: failure()
+        shell: bash
+        run: |
+          echo '--- Runtime versions ---'
+          node --version || true
+          npm --version || true
+          java -version || true
+          echo '--- Android SDK ---'
+          echo "ANDROID_HOME=${ANDROID_HOME:-not-set}"
+          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-not-set}"
+          command -v sdkmanager || true
+          echo '--- Repository root ---'
+          ls -la "$GITHUB_WORKSPACE" || true
